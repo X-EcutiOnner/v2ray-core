@@ -99,7 +99,6 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		IP:   address.IP(),
 		Port: int(port),
 	}, streamSettings.SocketSettings)
-
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +109,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		MaxIdleTimeout:        time.Second * 45,
 		MaxIncomingStreams:    32,
 		MaxIncomingUniStreams: -1,
+		KeepAlive:             true,
 	}
 
 	conn, err := wrapSysConn(rawConn, config)

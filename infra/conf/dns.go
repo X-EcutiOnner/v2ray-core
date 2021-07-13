@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -8,34 +9,43 @@ import (
 	"github.com/v2fly/v2ray-core/v4/app/dns"
 	"github.com/v2fly/v2ray-core/v4/app/router"
 	"github.com/v2fly/v2ray-core/v4/common/net"
+	"github.com/v2fly/v2ray-core/v4/common/platform"
+	"github.com/v2fly/v2ray-core/v4/infra/conf/cfgcommon"
+	"github.com/v2fly/v2ray-core/v4/infra/conf/geodata"
+	rule2 "github.com/v2fly/v2ray-core/v4/infra/conf/rule"
 )
 
 type NameServerConfig struct {
-	Address   *Address
-	ClientIP  *Address
-	Port      uint16
-	Domains   []string
-	ExpectIPs StringList
+	Address      *cfgcommon.Address
+	ClientIP     *cfgcommon.Address
+	Port         uint16
+	SkipFallback bool
+	Domains      []string
+	ExpectIPs    cfgcommon.StringList
+
+	cfgctx context.Context
 }
 
 func (c *NameServerConfig) UnmarshalJSON(data []byte) error {
-	var address Address
+	var address cfgcommon.Address
 	if err := json.Unmarshal(data, &address); err == nil {
 		c.Address = &address
 		return nil
 	}
 
 	var advanced struct {
-		Address   *Address   `json:"address"`
-		ClientIP  *Address   `json:"clientIp"`
-		Port      uint16     `json:"port"`
-		Domains   []string   `json:"domains"`
-		ExpectIPs StringList `json:"expectIps"`
+		Address      *cfgcommon.Address   `json:"address"`
+		ClientIP     *cfgcommon.Address   `json:"clientIp"`
+		Port         uint16               `json:"port"`
+		SkipFallback bool                 `json:"skipFallback"`
+		Domains      []string             `json:"domains"`
+		ExpectIPs    cfgcommon.StringList `json:"expectIps"`
 	}
 	if err := json.Unmarshal(data, &advanced); err == nil {
 		c.Address = advanced.Address
 		c.ClientIP = advanced.ClientIP
 		c.Port = advanced.Port
+		c.SkipFallback = advanced.SkipFallback
 		c.Domains = advanced.Domains
 		c.ExpectIPs = advanced.ExpectIPs
 		return nil
@@ -60,6 +70,8 @@ func toDomainMatchingType(t router.Domain_Type) dns.DomainMatchingType {
 }
 
 func (c *NameServerConfig) Build() (*dns.NameServer, error) {
+	cfgctx := c.cfgctx
+
 	if c.Address == nil {
 		return nil, newError("NameServer address is not specified.")
 	}
@@ -68,7 +80,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 	var originalRules []*dns.NameServer_OriginalRule
 
 	for _, rule := range c.Domains {
-		parsedDomain, err := parseDomainRule(rule)
+		parsedDomain, err := rule2.ParseDomainRule(cfgctx, rule)
 		if err != nil {
 			return nil, newError("invalid domain rule: ", rule).Base(err)
 		}
@@ -85,7 +97,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 		})
 	}
 
-	geoipList, err := toCidrList(c.ExpectIPs)
+	geoipList, err := rule2.ToCidrList(cfgctx, c.ExpectIPs)
 	if err != nil {
 		return nil, newError("invalid IP rule: ", c.ExpectIPs).Base(err)
 	}
@@ -105,6 +117,7 @@ func (c *NameServerConfig) Build() (*dns.NameServer, error) {
 			Port:    uint32(c.Port),
 		},
 		ClientIp:          myClientIP,
+		SkipFallback:      c.SkipFallback,
 		PrioritizedDomain: domains,
 		Geoip:             geoipList,
 		OriginalRules:     originalRules,
@@ -120,30 +133,82 @@ var typeMap = map[router.Domain_Type]dns.DomainMatchingType{
 
 // DNSConfig is a JSON serializable object for dns.Config.
 type DNSConfig struct {
-	Servers       []*NameServerConfig `json:"servers"`
-	Hosts         map[string]*Address `json:"hosts"`
-	ClientIP      *Address            `json:"clientIp"`
-	Tag           string              `json:"tag"`
-	QueryStrategy string              `json:"queryStrategy"`
-	DisableCache  bool                `json:"disableCache"`
+	Servers         []*NameServerConfig     `json:"servers"`
+	Hosts           map[string]*HostAddress `json:"hosts"`
+	ClientIP        *cfgcommon.Address      `json:"clientIp"`
+	Tag             string                  `json:"tag"`
+	QueryStrategy   string                  `json:"queryStrategy"`
+	DisableCache    bool                    `json:"disableCache"`
+	DisableFallback bool                    `json:"disableFallback"`
 }
 
-func getHostMapping(addr *Address) *dns.Config_HostMapping {
-	if addr.Family().IsIP() {
+type HostAddress struct {
+	addr  *cfgcommon.Address
+	addrs []*cfgcommon.Address
+}
+
+// UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
+func (h *HostAddress) UnmarshalJSON(data []byte) error {
+	addr := new(cfgcommon.Address)
+	var addrs []*cfgcommon.Address
+	switch {
+	case json.Unmarshal(data, &addr) == nil:
+		h.addr = addr
+	case json.Unmarshal(data, &addrs) == nil:
+		h.addrs = addrs
+	default:
+		return newError("invalid address")
+	}
+	return nil
+}
+
+func getHostMapping(ha *HostAddress) *dns.Config_HostMapping {
+	if ha.addr != nil {
+		if ha.addr.Family().IsDomain() {
+			return &dns.Config_HostMapping{
+				ProxiedDomain: ha.addr.Domain(),
+			}
+		}
 		return &dns.Config_HostMapping{
-			Ip: [][]byte{[]byte(addr.IP())},
+			Ip: [][]byte{ha.addr.IP()},
 		}
 	}
+
+	ips := make([][]byte, 0, len(ha.addrs))
+	for _, addr := range ha.addrs {
+		if addr.Family().IsDomain() {
+			return &dns.Config_HostMapping{
+				ProxiedDomain: addr.Domain(),
+			}
+		}
+		ips = append(ips, []byte(addr.IP()))
+	}
 	return &dns.Config_HostMapping{
-		ProxiedDomain: addr.Domain(),
+		Ip: ips,
 	}
 }
 
 // Build implements Buildable
 func (c *DNSConfig) Build() (*dns.Config, error) {
+	cfgctx := cfgcommon.NewConfigureLoadingContext(context.Background())
+
+	geoloadername := platform.NewEnvFlag("v2ray.conf.geoloader").GetValue(func() string {
+		return "standard"
+	})
+
+	if loader, err := geodata.GetGeoDataLoader(geoloadername); err == nil {
+		cfgcommon.SetGeoDataLoader(cfgctx, loader)
+	} else {
+		return nil, newError("unable to create geo data loader ").Base(err)
+	}
+
+	cfgEnv := cfgcommon.GetConfigureLoadingEnvironment(cfgctx)
+	geoLoader := cfgEnv.GetGeoLoader()
+
 	config := &dns.Config{
-		Tag:          c.Tag,
-		DisableCache: c.DisableCache,
+		Tag:             c.Tag,
+		DisableCache:    c.DisableCache,
+		DisableFallback: c.DisableFallback,
 	}
 
 	if c.ClientIP != nil {
@@ -164,6 +229,7 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 	}
 
 	for _, server := range c.Servers {
+		server.cfgctx = cfgctx
 		ns, err := server.Build()
 		if err != nil {
 			return nil, newError("failed to build nameserver").Base(err)
@@ -171,7 +237,9 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		config.NameServer = append(config.NameServer, ns)
 	}
 
-	if c.Hosts != nil && len(c.Hosts) > 0 {
+	if c.Hosts != nil {
+		mappings := make([]*dns.Config_HostMapping, 0, 20)
+
 		domains := make([]string, 0, len(c.Hosts))
 		for domain := range c.Hosts {
 			domains = append(domains, domain)
@@ -179,15 +247,13 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		sort.Strings(domains)
 
 		for _, domain := range domains {
-			addr := c.Hosts[domain]
-			var mappings []*dns.Config_HostMapping
 			switch {
 			case strings.HasPrefix(domain, "domain:"):
 				domainName := domain[7:]
 				if len(domainName) == 0 {
 					return nil, newError("empty domain type of rule: ", domain)
 				}
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Subdomain
 				mapping.Domain = domainName
 				mappings = append(mappings, mapping)
@@ -197,12 +263,12 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 				if len(listName) == 0 {
 					return nil, newError("empty geosite rule: ", domain)
 				}
-				domains, err := loadGeositeWithAttr("geosite.dat", listName)
+				geositeList, err := geoLoader.LoadGeoSite(listName)
 				if err != nil {
 					return nil, newError("failed to load geosite: ", listName).Base(err)
 				}
-				for _, d := range domains {
-					mapping := getHostMapping(addr)
+				for _, d := range geositeList {
+					mapping := getHostMapping(c.Hosts[domain])
 					mapping.Type = typeMap[d.Type]
 					mapping.Domain = d.Value
 					mappings = append(mappings, mapping)
@@ -213,7 +279,7 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 				if len(regexpVal) == 0 {
 					return nil, newError("empty regexp type of rule: ", domain)
 				}
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Regex
 				mapping.Domain = regexpVal
 				mappings = append(mappings, mapping)
@@ -223,7 +289,7 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 				if len(keywordVal) == 0 {
 					return nil, newError("empty keyword type of rule: ", domain)
 				}
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Keyword
 				mapping.Domain = keywordVal
 				mappings = append(mappings, mapping)
@@ -233,13 +299,13 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 				if len(fullVal) == 0 {
 					return nil, newError("empty full domain type of rule: ", domain)
 				}
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Full
 				mapping.Domain = fullVal
 				mappings = append(mappings, mapping)
 
 			case strings.HasPrefix(domain, "dotless:"):
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Regex
 				switch substr := domain[8:]; {
 				case substr == "":
@@ -258,26 +324,26 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 				}
 				filename := kv[0]
 				list := kv[1]
-				domains, err := loadGeositeWithAttr(filename, list)
+				geositeList, err := geoLoader.LoadGeoSiteWithAttr(filename, list)
 				if err != nil {
 					return nil, newError("failed to load domain list: ", list, " from ", filename).Base(err)
 				}
-				for _, d := range domains {
-					mapping := getHostMapping(addr)
+				for _, d := range geositeList {
+					mapping := getHostMapping(c.Hosts[domain])
 					mapping.Type = typeMap[d.Type]
 					mapping.Domain = d.Value
 					mappings = append(mappings, mapping)
 				}
 
 			default:
-				mapping := getHostMapping(addr)
+				mapping := getHostMapping(c.Hosts[domain])
 				mapping.Type = dns.DomainMatchingType_Full
 				mapping.Domain = domain
 				mappings = append(mappings, mapping)
 			}
-
-			config.StaticHosts = append(config.StaticHosts, mappings...)
 		}
+
+		config.StaticHosts = append(config.StaticHosts, mappings...)
 	}
 
 	return config, nil

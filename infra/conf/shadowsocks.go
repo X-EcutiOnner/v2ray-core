@@ -7,6 +7,7 @@ import (
 
 	"github.com/v2fly/v2ray-core/v4/common/protocol"
 	"github.com/v2fly/v2ray-core/v4/common/serial"
+	"github.com/v2fly/v2ray-core/v4/infra/conf/cfgcommon"
 	"github.com/v2fly/v2ray-core/v4/proxy/shadowsocks"
 )
 
@@ -26,13 +27,13 @@ func cipherFromString(c string) shadowsocks.CipherType {
 }
 
 type ShadowsocksServerConfig struct {
-	Cipher      string       `json:"method"`
-	Password    string       `json:"password"`
-	UDP         bool         `json:"udp"`
-	Level       byte         `json:"level"`
-	Email       string       `json:"email"`
-	NetworkList *NetworkList `json:"network"`
-	IVCheck     bool         `json:"ivCheck"`
+	Cipher      string                 `json:"method"`
+	Password    string                 `json:"password"`
+	UDP         bool                   `json:"udp"`
+	Level       byte                   `json:"level"`
+	Email       string                 `json:"email"`
+	NetworkList *cfgcommon.NetworkList `json:"network"`
+	IVCheck     bool                   `json:"ivCheck"`
 }
 
 func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
@@ -62,14 +63,14 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 }
 
 type ShadowsocksServerTarget struct {
-	Address  *Address `json:"address"`
-	Port     uint16   `json:"port"`
-	Cipher   string   `json:"method"`
-	Password string   `json:"password"`
-	Email    string   `json:"email"`
-	Ota      bool     `json:"ota"`
-	Level    byte     `json:"level"`
-	IVCheck  bool     `json:"ivCheck"`
+	Address  *cfgcommon.Address `json:"address"`
+	Port     uint16             `json:"port"`
+	Cipher   string             `json:"method"`
+	Password string             `json:"password"`
+	Email    string             `json:"email"`
+	Ota      bool               `json:"ota"`
+	Level    byte               `json:"level"`
+	IVCheck  bool               `json:"ivCheck"`
 }
 
 type ShadowsocksClientConfig struct {

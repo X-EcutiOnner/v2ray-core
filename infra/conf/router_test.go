@@ -3,6 +3,7 @@ package conf_test
 import (
 	"encoding/json"
 	"testing"
+	_ "unsafe"
 
 	"github.com/golang/protobuf/proto"
 
@@ -77,6 +78,7 @@ func TestRouterConfig(t *testing.T) {
 					{
 						Tag:              "b1",
 						OutboundSelector: []string{"test"},
+						Strategy:         "random",
 					},
 				},
 				Rule: []*router.RoutingRule{
